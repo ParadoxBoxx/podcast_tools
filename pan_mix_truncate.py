@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -65,7 +67,7 @@ def parse_args():
     parser.add_argument(
         "--silence-threshold",
         default=DEFAULT_SILENCE_THRESHOLD,
-        help="Silence threshold passed to ffmpeg silenceremove. Default: -35dB.",
+        help="Silence threshold for detection. Default: -35dB.",
     )
     parser.add_argument(
         "--silence-duration",
@@ -77,7 +79,7 @@ def parse_args():
         "--retain-silence",
         type=non_negative_float,
         default=DEFAULT_RETAIN_SILENCE,
-        help="Amount of each detected silent region to retain after truncation. Default: 0.50.",
+        help="Total silence to retain per detected region, split evenly around the cut point. Default: 0.50.",
     )
     parser.add_argument(
         "--dropout-transition",
@@ -212,7 +214,7 @@ def warn_on_non_mono_inputs(left_input, right_input):
         )
 
 
-def build_filtergraph(args):
+def build_mix_filtergraph(args):
     normalize_flag = 1 if args.mix_normalize else 0
     left_balance = -abs(args.left_pan)
     right_balance = abs(args.right_pan)
@@ -220,17 +222,8 @@ def build_filtergraph(args):
     mix_chain = (
         "[left][right]amix="
         f"inputs=2:normalize={normalize_flag}:dropout_transition={args.dropout_transition:.3f}"
+        "[outa]"
     )
-    if args.truncate_silence:
-        mix_chain += (
-            ",silenceremove="
-            f"start_periods=1:start_duration={args.silence_duration:.3f}:"
-            f"start_threshold={args.silence_threshold}:start_silence={args.retain_silence:.3f}:"
-            f"stop_periods=-1:stop_duration={args.silence_duration:.3f}:"
-            f"stop_threshold={args.silence_threshold}:stop_silence={args.retain_silence:.3f}:"
-            "detection=rms"
-        )
-    mix_chain += "[outa]"
 
     return ";".join(
         [
@@ -245,6 +238,114 @@ def run_command(command):
     result = subprocess.run(command)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
+
+
+def format_duration(seconds):
+    minutes, secs = divmod(seconds, 60)
+    return f"{int(minutes)}:{secs:05.2f}"
+
+
+def probe_duration(input_path):
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        return None
+    command = [
+        ffprobe_bin, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(input_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def detect_silence_regions(ffmpeg_bin, audio_path, threshold, duration):
+    """Detect silence regions using ffmpeg silencedetect filter."""
+    command = [
+        ffmpeg_bin, "-hide_banner", "-i", str(audio_path),
+        "-af", f"silencedetect=noise={threshold}:duration={duration:.3f}:mono=false",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    regions = []
+    start = None
+    for line in result.stderr.splitlines():
+        m_start = re.search(r"silence_start:\s*([\d.]+)", line)
+        m_end = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m_start:
+            start = float(m_start.group(1))
+        elif m_end and start is not None:
+            end = float(m_end.group(1))
+            regions.append((start, end))
+            start = None
+    return regions
+
+
+def compute_keep_intervals(silence_regions, retain_seconds, total_duration):
+    """Compute time intervals to keep, removing from the CENTER of each silence region.
+
+    This matches Audacity's Truncate Silence behavior: half the retain time is
+    preserved on each side of the cut, keeping word tails and onsets intact.
+    """
+    half = retain_seconds / 2.0
+    remove_ranges = []
+    for s_start, s_end in silence_regions:
+        if s_end - s_start <= retain_seconds:
+            continue
+        cut_start = s_start + half
+        cut_end = s_end - half
+        if cut_end > cut_start:
+            remove_ranges.append((cut_start, cut_end))
+
+    if not remove_ranges:
+        return None
+
+    keep = []
+    pos = 0.0
+    for cut_start, cut_end in remove_ranges:
+        if cut_start > pos:
+            keep.append((pos, cut_start))
+        pos = cut_end
+    if pos < total_duration:
+        keep.append((pos, total_duration))
+    return [(s, e) for s, e in keep if e - s > 0.001]
+
+
+def write_trimmed_audio(ffmpeg_bin, input_path, output_path, keep_intervals,
+                        audio_codec, audio_bitrate, overwrite):
+    """Write output audio keeping only the specified intervals, using atrim+concat."""
+    with tempfile.TemporaryDirectory(prefix="silence_trim_") as temp_dir:
+        script_path = Path(temp_dir) / "filtergraph.txt"
+        parts = []
+        labels = []
+        for index, (start, end) in enumerate(keep_intervals):
+            label = f"a{index}"
+            labels.append(f"[{label}]")
+            parts.append(
+                f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[{label}]"
+            )
+        if len(labels) == 1:
+            parts.append(f"{labels[0]}anull[outa]")
+        else:
+            parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[outa]")
+        script_path.write_text(";\n".join(parts), encoding="ascii")
+
+        command = [
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-y" if overwrite else "-n",
+            "-i", str(input_path),
+            "-filter_complex_script", str(script_path),
+            "-map", "[outa]", "-vn", "-c:a", audio_codec,
+        ]
+        if audio_bitrate:
+            command.extend(["-b:a", audio_bitrate])
+        if audio_codec == "aac" and output_path.suffix.lower() in {".m4a", ".mp4"}:
+            command.extend(["-movflags", "+faststart"])
+        command.append(str(output_path))
+        run_command(command)
 
 
 def main():
@@ -271,33 +372,79 @@ def main():
     audio_codec = choose_audio_codec(output_path, args.audio_codec)
     audio_bitrate = choose_audio_bitrate(audio_codec, args.audio_bitrate)
 
-    command = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-y" if args.overwrite else "-n",
-        "-i",
-        str(left_input),
-        "-i",
-        str(right_input),
-        "-filter_complex",
-        build_filtergraph(args),
-        "-map",
-        "[outa]",
-        "-vn",
-        "-c:a",
-        audio_codec,
-    ]
-    if audio_bitrate:
-        command.extend(["-b:a", audio_bitrate])
-    if audio_codec == "aac" and output_path.suffix.lower() in {".m4a", ".mp4"}:
-        command.extend(["-movflags", "+faststart"])
-    command.append(str(output_path))
+    if not args.truncate_silence:
+        print(f"Mixing {left_input.name} + {right_input.name} (no silence truncation)")
+        command = [
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-y" if args.overwrite else "-n",
+            "-i", str(left_input), "-i", str(right_input),
+            "-filter_complex", build_mix_filtergraph(args),
+            "-map", "[outa]", "-vn", "-c:a", audio_codec,
+        ]
+        if audio_bitrate:
+            command.extend(["-b:a", audio_bitrate])
+        if audio_codec == "aac" and output_path.suffix.lower() in {".m4a", ".mp4"}:
+            command.extend(["-movflags", "+faststart"])
+        command.append(str(output_path))
+        run_command(command)
+        print(f"Done → {output_path}")
+        return
 
-    run_command(command)
-    print(f"Wrote merged output: {output_path}")
+    # Two-pass approach matching Audacity Truncate Silence:
+    #   1. Pan + mix → temporary WAV
+    #   2. Detect silence → trim from middle of each region → encode output
+    with tempfile.TemporaryDirectory(prefix="pan_mix_trunc_") as temp_dir:
+        temp_path = Path(temp_dir) / "mixed.wav"
+
+        print(f"Mixing {left_input.name} + {right_input.name}")
+        mix_cmd = [
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-i", str(left_input), "-i", str(right_input),
+            "-filter_complex", build_mix_filtergraph(args),
+            "-map", "[outa]", "-vn", "-c:a", "pcm_s16le",
+            str(temp_path),
+        ]
+        run_command(mix_cmd)
+
+        total_duration = probe_duration(temp_path)
+        if total_duration:
+            print(f"Mixed duration: {format_duration(total_duration)}")
+
+        print(f"Detecting silence (threshold {args.silence_threshold}, min duration {args.silence_duration}s)")
+        regions = detect_silence_regions(
+            ffmpeg_bin, temp_path, args.silence_threshold, args.silence_duration
+        )
+        print(f"Found {len(regions)} silence region(s)")
+
+        keep_intervals = None
+        if regions and total_duration:
+            keep_intervals = compute_keep_intervals(regions, args.retain_silence, total_duration)
+
+        if keep_intervals:
+            kept = sum(e - s for s, e in keep_intervals)
+            removed = total_duration - kept
+            print(f"Trimming {format_duration(removed)} of silence → {format_duration(kept)} final")
+            print("Encoding output")
+            write_trimmed_audio(
+                ffmpeg_bin, temp_path, output_path, keep_intervals,
+                audio_codec, audio_bitrate, args.overwrite,
+            )
+        else:
+            print("No silence long enough to truncate; encoding as-is")
+            encode_cmd = [
+                ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-y" if args.overwrite else "-n",
+                "-i", str(temp_path),
+                "-vn", "-c:a", audio_codec,
+            ]
+            if audio_bitrate:
+                encode_cmd.extend(["-b:a", audio_bitrate])
+            if audio_codec == "aac" and output_path.suffix.lower() in {".m4a", ".mp4"}:
+                encode_cmd.extend(["-movflags", "+faststart"])
+            encode_cmd.append(str(output_path))
+            run_command(encode_cmd)
+
+    print(f"Done → {output_path}")
 
 
 if __name__ == "__main__":

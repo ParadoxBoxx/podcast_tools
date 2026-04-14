@@ -430,6 +430,7 @@ def main():
     if args.cut_fillers:
         ffmpeg_bin = require_binary(args.ffmpeg_bin)
 
+    print(f"Loading model: {args.model} (device={args.device}, compute={args.compute_type})")
     model = WhisperModel(
         args.model,
         device=args.device,
@@ -437,6 +438,7 @@ def main():
         download_root=args.download_root,
         local_files_only=args.local_files_only,
     )
+    print(f"Transcribing: {input_path.name}")
     segments_iterable, info = model.transcribe(
         str(input_path),
         language=args.language,
@@ -452,13 +454,17 @@ def main():
     )
     segments = list(segments_iterable)
     total_duration = float(getattr(info, "duration", 0.0) or 0.0)
+    detected_lang = getattr(info, "language", "unknown")
+    print(f"Transcribed {len(segments)} segment(s), language={detected_lang}, duration={total_duration:.1f}s")
 
+    print(f"Scanning for fillers: {', '.join(filler_tokens)}")
     matches = collect_filler_matches(
         segments,
         set(filler_tokens),
         args.min_word_probability,
         args.max_filler_duration,
     )
+    print(f"Found {len(matches)} filler match(es)")
     cut_intervals = []
     keep_intervals = [(0.0, total_duration)] if total_duration > 0 else []
     if args.cut_fillers and total_duration > 0:
@@ -495,13 +501,16 @@ def main():
         "segments": serialize_segments(segments),
     }
     transcript_output.write_text(json.dumps(transcript_payload, indent=2), encoding="utf-8")
+    print(f"Wrote transcript → {transcript_output}")
 
     if not args.cut_fillers or not cut_intervals:
         if cleaned_output.exists() and not args.overwrite:
             raise SystemExit(f"Cleaned output already exists. Use --overwrite to replace it: {cleaned_output}")
         shutil.copy2(input_path, cleaned_output)
-        action = "copied input without cuts"
+        print(f"No fillers to cut; copied input → {cleaned_output}")
     else:
+        cut_total = sum(e - s for s, e in cut_intervals)
+        print(f"Cutting {len(cut_intervals)} filler interval(s) ({cut_total:.2f}s removed)")
         audio_codec = choose_audio_codec(cleaned_output, args.audio_codec)
         audio_bitrate = choose_audio_bitrate(audio_codec, args.audio_bitrate)
         write_cleaned_audio(
@@ -513,10 +522,7 @@ def main():
             audio_bitrate,
             args.overwrite,
         )
-        action = f"cut {len(cut_intervals)} filler interval(s)"
-
-    print(f"Wrote transcript: {transcript_output}")
-    print(f"Wrote cleaned audio: {cleaned_output} ({action})")
+        print(f"Wrote cleaned audio → {cleaned_output}")
 
 
 if __name__ == "__main__":
