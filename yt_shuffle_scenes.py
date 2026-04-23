@@ -1261,6 +1261,7 @@ def main() -> int:
     prepare_job_directories(job_dir, args.overwrite)
 
     if source_path.exists() and source_path.is_file():
+        print(f"Using local source: {source_path.name}")
         acquired_source = copy_local_source(source_path.resolve(), raw_dir)
     else:
         if not args.skip_yt_dlp_update:
@@ -1270,12 +1271,14 @@ def main() -> int:
     print(f"Formatting source video for Vegas-ready output: {acquired_source.name}")
     source_encoder = encode_silent_h264(acquired_source, formatted_path)
     total_duration = get_duration_seconds(formatted_path)
+    print(f"  Source duration: {total_duration:.2f}s  |  encoder: {source_encoder}")
 
     print(
-        f"Detecting scene boundaries with threshold {args.scene_threshold:.3f} and minimum duration {args.min_scene_duration:.3f}s"
+        f"Detecting scene boundaries (threshold={args.scene_threshold:.3f}, min_duration={args.min_scene_duration:.3f}s)..."
     )
     scene_times = detect_scene_times(formatted_path, args.scene_threshold)
     detected_segments = build_segments(scene_times, total_duration, args.min_scene_duration)
+    print(f"  {len(scene_times)} raw boundary candidate(s) → {len(detected_segments)} segment(s) after merge")
     text_kept_segments, text_dropped_segments, candidate_segments, text_only_filter_suppression = filter_text_only_segments(
         formatted_path,
         detected_segments,
@@ -1367,8 +1370,10 @@ def main() -> int:
 
     clip_paths: list[Path] = []
     clip_encoder = source_encoder
-    for segment in segments:
+    total_segments = len(segments)
+    for i, segment in enumerate(segments, 1):
         clip_path = clips_dir / f"scene_{int(segment['scene_index']):03d}.mp4"
+        print(f"  [{i}/{total_segments}] {clip_path.name}  ({float(segment['start']):.2f}s – {float(segment['end']):.2f}s, {float(segment['duration']):.2f}s)")
         clip_encoder = cut_scene_clip(
             formatted_path,
             clip_path,
@@ -1386,6 +1391,7 @@ def main() -> int:
         shutil.copy2(shuffled_clip_paths[0], final_output_path)
         final_encoder = clip_encoder
     else:
+        print(f"Concatenating {len(shuffled_clip_paths)} clips in shuffled order...")
         final_encoder = concat_scene_clips(manifests_dir / "shuffled_order.txt", final_output_path)
 
     write_summary(
@@ -1409,11 +1415,13 @@ def main() -> int:
     )
 
     if not args.keep_intermediate:
+        print("Cleaning up intermediate files...")
         shutil.rmtree(job_dir)
 
-    print(f"Wrote final shuffled output: {final_output_path}")
-    print(f"Wrote shuffle summary: {summary_path}")
-    print(f"Wrote segment filter report: {filter_manifest_path}")
+    print(f"Done.")
+    print(f"  Final shuffled output: {final_output_path}")
+    print(f"  Shuffle summary:       {summary_path}")
+    print(f"  Segment filter report: {filter_manifest_path}")
     return 0
 
 
