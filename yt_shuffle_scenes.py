@@ -15,7 +15,7 @@ from typing import Iterable
 from yt_to_vegas import DEFAULT_DOWNLOAD_DIR, DEFAULT_OUTPUT_DIR, normalize_url, sanitize_filename
 
 
-DEFAULT_SCENE_THRESHOLD = 0.20
+DEFAULT_SCENE_THRESHOLD = 0.10
 DEFAULT_MIN_SCENE_DURATION = 0.75
 DEFAULT_WORK_DIR = DEFAULT_DOWNLOAD_DIR / "scene_shuffle"
 DEFAULT_TEXT_FILTER_SAMPLE_COUNT = 3
@@ -140,7 +140,7 @@ def parse_args() -> argparse.Namespace:
         "--scene-threshold",
         type=positive_float,
         default=DEFAULT_SCENE_THRESHOLD,
-        help="Scene detection threshold passed to ffmpeg's scene score comparison. Lower values detect more cuts. Default: 0.20.",
+        help="Scene detection threshold passed to ffmpeg's scene score comparison. Lower values detect more cuts. Default: 0.10.",
     )
     parser.add_argument(
         "--min-scene-duration",
