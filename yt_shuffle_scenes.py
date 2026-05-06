@@ -824,7 +824,14 @@ def filter_text_only_segments(
     dropped: list[dict[str, float | int | str | dict[str, bool | float | int | str]]] = []
     suppression = TextOnlyFilterSuppression(fired=False)
 
+    total = len(segments)
     for segment in segments:
+        scene_num = int(segment["scene_index"]) + 1
+        if settings.enabled:
+            print(
+                f"  Sampling scene {scene_num}/{total}  ({float(segment['start']):.2f}s – {float(segment['end']):.2f}s, {float(segment['duration']):.2f}s)...",
+                flush=True,
+            )
         candidate = dict(segment)
         candidate["source_scene_index"] = int(segment["scene_index"])
         candidate["text_only_filter"] = classify_segment_for_text_only_filter(video_path, segment, settings)
@@ -1264,17 +1271,20 @@ def main() -> int:
             update_yt_dlp()
         acquired_source = download_source_video(args.source, raw_dir)
 
-    print(f"Formatting source video for Vegas-ready output: {acquired_source.name}")
+    print(f"Formatting source video for Vegas-ready output: {acquired_source.name}", flush=True)
     source_encoder = encode_silent_h264(acquired_source, formatted_path)
     total_duration = get_duration_seconds(formatted_path)
-    print(f"  Source duration: {total_duration:.2f}s  |  encoder: {source_encoder}")
+    print(f"  Source duration: {total_duration:.2f}s  |  encoder: {source_encoder}", flush=True)
 
     print(
-        f"Detecting scene boundaries (threshold={args.scene_threshold:.3f}, min_duration={args.min_scene_duration:.3f}s)..."
+        f"Detecting scene boundaries (threshold={args.scene_threshold:.3f}, min_duration={args.min_scene_duration:.3f}s)...",
+        flush=True,
     )
     scene_times = detect_scene_times(formatted_path, args.scene_threshold)
     detected_segments = build_segments(scene_times, total_duration, args.min_scene_duration)
-    print(f"  {len(scene_times)} raw boundary candidate(s) → {len(detected_segments)} segment(s) after merge")
+    print(f"  {len(scene_times)} raw boundary candidate(s) → {len(detected_segments)} segment(s) after merge", flush=True)
+    if text_only_filter_settings.enabled and detected_segments:
+        print(f"Analyzing {len(detected_segments)} segment(s) for text-only/title-card scenes...", flush=True)
     text_kept_segments, text_dropped_segments, candidate_segments, text_only_filter_suppression = filter_text_only_segments(
         formatted_path,
         detected_segments,
@@ -1360,16 +1370,16 @@ def main() -> int:
             print("End-card removal kept the trailing scene suffix unchanged.")
 
     if len(segments) == 1:
-        print("Scene processing produced a single kept segment; final output will match that segment's formatted profile.")
+        print("Scene processing produced a single kept segment; final output will match that segment's formatted profile.", flush=True)
     else:
-        print(f"Cutting {len(segments)} scene clips...")
+        print(f"Cutting {len(segments)} scene clips...", flush=True)
 
     clip_paths: list[Path] = []
     clip_encoder = source_encoder
     total_segments = len(segments)
     for i, segment in enumerate(segments, 1):
         clip_path = clips_dir / f"scene_{int(segment['scene_index']):03d}.mp4"
-        print(f"  [{i}/{total_segments}] {clip_path.name}  ({float(segment['start']):.2f}s – {float(segment['end']):.2f}s, {float(segment['duration']):.2f}s)")
+        print(f"  [{i}/{total_segments}] Slicing {clip_path.name}  ({float(segment['start']):.2f}s – {float(segment['end']):.2f}s, {float(segment['duration']):.2f}s)", flush=True)
         clip_encoder = cut_scene_clip(
             formatted_path,
             clip_path,
