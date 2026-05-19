@@ -354,7 +354,7 @@ def update_yt_dlp() -> None:
 @lru_cache(maxsize=1)
 def ffmpeg_supports_nvenc() -> bool:
     try:
-        result = run_command(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True)
+        result = run_command(["ffmpeg", "-encoders"], capture_output=True)
     except subprocess.CalledProcessError:
         return False
     return "h264_nvenc" in result.stdout
@@ -455,7 +455,6 @@ def encode_silent_h264(input_path: Path, output_path: Path) -> str:
         gpu_command = [
             "ffmpeg",
             "-y",
-            "-hide_banner",
             "-hwaccel",
             "cuda",
             "-i",
@@ -480,7 +479,6 @@ def encode_silent_h264(input_path: Path, output_path: Path) -> str:
     cpu_command = [
         "ffmpeg",
         "-y",
-        "-hide_banner",
         "-i",
         str(input_path),
         "-c:v",
@@ -518,7 +516,6 @@ def get_duration_seconds(video_path: Path) -> float:
 def detect_scene_times(video_path: Path, threshold: float) -> list[float]:
     command = [
         "ffmpeg",
-        "-hide_banner",
         "-i",
         str(video_path),
         "-filter_complex",
@@ -607,7 +604,6 @@ def sample_segment_frames(
     sample_rate = max(settings.sample_count / sampling_window, 1.0)
     command = [
         "ffmpeg",
-        "-hide_banner",
         "-loglevel",
         "error",
         "-ss",
@@ -1040,7 +1036,6 @@ def cut_scene_clip(formatted_path: Path, clip_path: Path, start_time: float, dur
         gpu_command = [
             "ffmpeg",
             "-y",
-            "-hide_banner",
             "-loglevel",
             "error",
             "-hwaccel",
@@ -1071,7 +1066,6 @@ def cut_scene_clip(formatted_path: Path, clip_path: Path, start_time: float, dur
     cpu_command = [
         "ffmpeg",
         "-y",
-        "-hide_banner",
         "-loglevel",
         "error",
         "-i",
@@ -1116,7 +1110,6 @@ def concat_scene_clips(manifest_path: Path, output_path: Path) -> str:
     command = [
         "ffmpeg",
         "-y",
-        "-hide_banner",
         "-loglevel",
         "error",
         "-f",
