@@ -36,6 +36,7 @@ DEFAULT_END_CARD_MIN_DOMINANT_COVERAGE = 0.42
 DEFAULT_END_CARD_MIN_EDGE_DENSITY = 0.008
 DEFAULT_END_CARD_MAX_EDGE_DENSITY = 0.26
 DEFAULT_END_CARD_MAX_EDGE_ROW_COVERAGE = 0.82
+DEFAULT_BLACK_SCENE_THRESHOLD = 0.90
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,23 @@ class EndCardFilterSettings:
 
 @dataclass(frozen=True)
 class EndCardFilterSuppression:
+    fired: bool
+    reason: str = ""
+    suppressed_drop_count: int = 0
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class BlackSceneFilterSettings:
+    enabled: bool
+    darkness_threshold: float
+    sample_count: int
+    frame_width: int = DEFAULT_TEXT_FILTER_FRAME_WIDTH
+    frame_height: int = DEFAULT_TEXT_FILTER_FRAME_HEIGHT
+
+
+@dataclass(frozen=True)
+class BlackSceneFilterSuppression:
     fired: bool
     reason: str = ""
     suppressed_drop_count: int = 0
@@ -209,6 +227,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--filter-black-scenes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Detect and remove scenes that are mostly black/dark (useful for removing fadeout transitions). "
+            "Default: disabled."
+        ),
+    )
+    parser.add_argument(
+        "--black-scene-threshold",
+        type=unit_interval_float,
+        default=DEFAULT_BLACK_SCENE_THRESHOLD,
+        help=(
+            "Fraction of pixels that must be dark (below 50 brightness) for a scene to be flagged as black. "
+            "Default: 0.90."
+        ),
+    )
+    parser.add_argument(
         "--remove-end-cards",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -334,6 +370,14 @@ def build_end_card_visual_analysis_settings(
         frame_width=sampling_settings.frame_width,
         frame_height=sampling_settings.frame_height,
         edge_threshold=sampling_settings.edge_threshold,
+    )
+
+
+def build_black_scene_filter_settings(args: argparse.Namespace) -> BlackSceneFilterSettings:
+    return BlackSceneFilterSettings(
+        enabled=args.filter_black_scenes,
+        darkness_threshold=args.black_scene_threshold,
+        sample_count=args.text_filter_sample_count,
     )
 
 
@@ -648,6 +692,21 @@ def compute_dominant_coverage(frame: bytes, bucket_count: int = 16) -> float:
     return sum(dominant) / len(frame)
 
 
+def compute_average_luminance(frame: bytes) -> float:
+    """Compute the average grayscale value (0-255) of a frame."""
+    if not frame:
+        return 0.0
+    return sum(frame) / len(frame)
+
+
+def compute_darkness_ratio(frame: bytes, darkness_threshold: int = 50) -> float:
+    """Compute the fraction of pixels below a darkness threshold (default 50/255)."""
+    if not frame:
+        return 0.0
+    dark_pixels = sum(1 for value in frame if value < darkness_threshold)
+    return dark_pixels / len(frame)
+
+
 def compute_edge_profile(frame: bytes, width: int, height: int, threshold: int) -> dict[str, float]:
     if width < 2 or height < 2:
         return {
@@ -805,6 +864,66 @@ def classify_segment_for_visual_analysis(
     return analysis
 
 
+def classify_segment_for_black_scene_filter(
+    video_path: Path,
+    segment: dict[str, float | int],
+    settings: BlackSceneFilterSettings,
+) -> dict[str, bool | float | int | str]:
+    if not settings.enabled:
+        return {
+            "enabled": False,
+            "drop": False,
+            "reason": "disabled",
+        }
+
+    try:
+        frames = sample_segment_frames(
+            video_path,
+            start_time=float(segment["start"]),
+            duration=float(segment["duration"]),
+            settings=TextOnlyFilterSettings(
+                enabled=True,
+                sample_count=settings.sample_count,
+                max_motion=0,
+                min_dominant_coverage=0,
+                min_edge_density=0,
+                max_edge_density=1,
+                max_edge_row_coverage=1,
+                frame_width=settings.frame_width,
+                frame_height=settings.frame_height,
+            ),
+        )
+    except subprocess.CalledProcessError as exc:
+        message = exc.stderr.decode("utf-8", errors="replace").strip() if exc.stderr else str(exc)
+        return {
+            "enabled": True,
+            "drop": False,
+            "reason": "analysis_error",
+            "error": message[:240],
+        }
+
+    if len(frames) < 1:
+        return {
+            "enabled": True,
+            "drop": False,
+            "reason": "insufficient_samples",
+            "sampled_frames": 0,
+        }
+
+    darkness_ratios = [compute_darkness_ratio(frame) for frame in frames]
+    average_darkness = mean(darkness_ratios)
+    is_mostly_black = average_darkness >= settings.darkness_threshold
+    
+    return {
+        "enabled": True,
+        "drop": is_mostly_black,
+        "reason": "mostly_black" if is_mostly_black else "sufficient_content",
+        "sampled_frames": len(frames),
+        "average_darkness_ratio": round(average_darkness, 6),
+        "darkness_threshold": settings.darkness_threshold,
+    }
+
+
 def filter_text_only_segments(
     video_path: Path,
     segments: list[dict[str, float | int]],
@@ -862,6 +981,59 @@ def filter_text_only_segments(
             kept.append(kept_segment)
 
     return kept, dropped, candidates, suppression
+
+
+def filter_black_scenes(
+    video_path: Path,
+    segments: list[dict[str, float | int | str | bool | dict[str, bool | float | int | str]]],
+    settings: BlackSceneFilterSettings,
+) -> tuple[
+    list[dict[str, float | int | str | bool | dict[str, bool | float | int | str]]],
+    list[dict[str, float | int | str | bool | dict[str, bool | float | int | str]]],
+    BlackSceneFilterSuppression,
+]:
+    kept: list[dict[str, float | int | str | bool | dict[str, bool | float | int | str]]] = []
+    dropped: list[dict[str, float | int | str | bool | dict[str, bool | float | int | str]]] = []
+    suppression = BlackSceneFilterSuppression(fired=False)
+
+    total = len(segments)
+    for segment in segments:
+        scene_num = int(segment["scene_index"]) + 1
+        if settings.enabled:
+            print(
+                f"  Scanning scene {scene_num}/{total}  ({float(segment['start']):.2f}s – {float(segment['end']):.2f}s, {float(segment['duration']):.2f}s) for darkness...",
+                flush=True,
+            )
+        segment["black_scene_filter"] = classify_segment_for_black_scene_filter(video_path, segment, settings)
+        segment["black_scene_filter_effective_drop"] = bool(segment["black_scene_filter"]["drop"])
+
+        if segment["black_scene_filter_effective_drop"]:
+            dropped.append(segment)
+        else:
+            kept_segment = dict(segment)
+            kept_segment["scene_index"] = len(kept)
+            kept.append(kept_segment)
+
+    if settings.enabled and segments and not kept:
+        suppressed_drop_count = len(dropped)
+        suppression = BlackSceneFilterSuppression(
+            fired=True,
+            reason="all_segments_flagged",
+            suppressed_drop_count=suppressed_drop_count,
+            message=(
+                "Black-scene filter suppression fired because every detected segment was flagged; "
+                "preserving all segments for this run."
+            ),
+        )
+        kept = []
+        dropped = []
+        for segment in segments:
+            segment["black_scene_filter_effective_drop"] = False
+            kept_segment = dict(segment)
+            kept_segment["scene_index"] = len(kept)
+            kept.append(kept_segment)
+
+    return kept, dropped, suppression
 
 
 def classify_segment_for_end_card_filter(
@@ -1219,6 +1391,7 @@ def main() -> int:
     args = parse_args()
     check_required_binaries()
     text_only_filter_settings = build_text_only_filter_settings(args)
+    black_scene_filter_settings = build_black_scene_filter_settings(args)
     end_card_filter_settings = build_end_card_filter_settings(args)
     end_card_visual_analysis_settings = build_end_card_visual_analysis_settings(
         text_only_filter_settings,
@@ -1283,9 +1456,26 @@ def main() -> int:
         detected_segments,
         text_only_filter_settings,
     )
+    
+    black_scene_suppression = BlackSceneFilterSuppression(fired=False)
+    black_dropped_segments: list[dict[str, float | int | str | bool | dict[str, bool | float | int | str]]] = []
+    if black_scene_filter_settings.enabled and text_kept_segments:
+        print(f"Analyzing {len(text_kept_segments)} segment(s) for mostly-black scenes...", flush=True)
+        text_kept_segments, black_dropped_segments, black_scene_suppression = filter_black_scenes(
+            formatted_path,
+            text_kept_segments,
+            black_scene_filter_settings,
+        )
+    
     for candidate_segment in candidate_segments:
         candidate_segment["removal_reasons"] = []
         candidate_segment["effective_removed"] = False
+        candidate_segment["black_scene_filter"] = {
+            "enabled": black_scene_filter_settings.enabled,
+            "drop": False,
+            "reason": "not_evaluated",
+        }
+        candidate_segment["black_scene_filter_effective_drop"] = False
         candidate_segment["end_card_filter"] = {
             "enabled": end_card_filter_settings.enabled,
             "drop": False,
@@ -1296,10 +1486,27 @@ def main() -> int:
     for candidate_segment in text_dropped_segments:
         candidate_segment["removal_reasons"] = ["text_only"]
         candidate_segment["effective_removed"] = True
+        candidate_segment["black_scene_filter"] = {
+            "enabled": black_scene_filter_settings.enabled,
+            "drop": False,
+            "reason": "skipped_text_only_removed",
+        }
+        candidate_segment["black_scene_filter_effective_drop"] = False
         candidate_segment["end_card_filter"] = {
             "enabled": end_card_filter_settings.enabled,
             "drop": False,
             "reason": "skipped_text_only_removed",
+        }
+        candidate_segment["end_card_filter_effective_drop"] = False
+    
+    for candidate_segment in black_dropped_segments:
+        candidate_segment["removal_reasons"] = ["black_scene"]
+        candidate_segment["effective_removed"] = True
+        candidate_segment["black_scene_filter_effective_drop"] = True
+        candidate_segment["end_card_filter"] = {
+            "enabled": end_card_filter_settings.enabled,
+            "drop": False,
+            "reason": "skipped_black_scene_removed",
         }
         candidate_segment["end_card_filter_effective_drop"] = False
 
@@ -1323,7 +1530,7 @@ def main() -> int:
         candidate_segment["end_card_filter_effective_drop"] = update["end_card_filter_effective_drop"]
         candidate_segment["removal_reasons"] = update["removal_reasons"]
         candidate_segment["effective_removed"] = update["effective_removed"]
-    dropped_segments = text_dropped_segments + end_card_dropped_segments
+    dropped_segments = text_dropped_segments + black_dropped_segments + end_card_dropped_segments
     flagged_segments = [segment for segment in candidate_segments if segment["text_only_filter"]["drop"]]
     write_segment_filter_manifest(
         filter_manifest_path,
@@ -1343,10 +1550,24 @@ def main() -> int:
             )
         elif text_dropped_segments:
             print(
-                f"Dropped {len(text_dropped_segments)} text-only scene candidate(s); {len(segments)} segment(s) remain after filtering."
+                f"Dropped {len(text_dropped_segments)} text-only scene candidate(s); {len(text_kept_segments) + len(black_dropped_segments) + len(end_card_dropped_segments)} segment(s) remain after filtering."
             )
         else:
             print("Text-only scene filter kept all detected segments.")
+    
+    if black_scene_filter_settings.enabled:
+        if black_scene_suppression.fired:
+            print(f"Warning: {black_scene_suppression.message}", file=sys.stderr)
+            print(
+                "Black-scene filter flagged all remaining segments; suppression preserved all segments and the report "
+                f"records {black_scene_suppression.suppressed_drop_count} originally flagged candidate(s)."
+            )
+        elif black_dropped_segments:
+            print(
+                f"Dropped {len(black_dropped_segments)} mostly-black scene candidate(s); {len(segments)} segment(s) remain after filtering."
+            )
+        else:
+            print("Black-scene filter kept all remaining segments.")
 
     if end_card_filter_settings.enabled:
         if end_card_filter_suppression.fired:
