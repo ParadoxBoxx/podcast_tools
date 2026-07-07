@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""Download (or reuse) a video, cut it into scenes, filter junk scenes, and shuffle the rest.
+
+Part of the video chain (see pipeline.py). The output is a silent Vegas-ready H.264 MP4
+whose scenes play in a shuffled order, for use as background visuals without triggering
+content matching.
+
+Before clips are cut, three filters remove scenes that should not appear in the shuffle:
+- text-only filter: static title cards / text screens / blank flat frames
+- black-scene filter: mostly-dark transition scenes (fade-throughs)
+- end-card filter: static branded outro/end-screen scenes in the late timeline
+
+All three are suppression-safe: if a filter would drop every remaining scene, it instead
+keeps them all and records the suppression in the run report. Motion scoring ignores the
+single largest frame-to-frame delta so cards with fade animations still register as static.
+"""
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -18,7 +33,7 @@ from yt_to_vegas import DEFAULT_DOWNLOAD_DIR, DEFAULT_OUTPUT_DIR, normalize_url,
 DEFAULT_SCENE_THRESHOLD = 0.10
 DEFAULT_MIN_SCENE_DURATION = 0.75
 DEFAULT_WORK_DIR = DEFAULT_DOWNLOAD_DIR / "scene_shuffle"
-DEFAULT_TEXT_FILTER_SAMPLE_COUNT = 3
+DEFAULT_TEXT_FILTER_SAMPLE_COUNT = 5
 DEFAULT_TEXT_FILTER_FRAME_WIDTH = 160
 DEFAULT_TEXT_FILTER_FRAME_HEIGHT = 90
 DEFAULT_TEXT_FILTER_MAX_MOTION = 4.0
@@ -179,7 +194,7 @@ def parse_args() -> argparse.Namespace:
         "--text-filter-sample-count",
         type=positive_int,
         default=DEFAULT_TEXT_FILTER_SAMPLE_COUNT,
-        help="Number of evenly spaced frames to sample per scene for the text-only filter. Default: 3.",
+        help="Number of evenly spaced frames to sample per scene for the text-only filter. Default: 5.",
     )
     parser.add_argument(
         "--text-filter-max-motion",
@@ -229,10 +244,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--filter-black-scenes",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Detect and remove scenes that are mostly black/dark (useful for removing fadeout transitions). "
-            "Default: disabled."
+            "Detect and remove scenes that are mostly black/dark (useful for removing fadeout transitions "
+            "and dark company logo cards). Default: enabled."
         ),
     )
     parser.add_argument(
@@ -743,6 +758,14 @@ def compute_motion_score(frames: list[bytes]) -> float:
         for left, right in zip(previous, current):
             diff_total += abs(left - right)
         scores.append(diff_total / len(previous))
+
+    # A static card with a fade-in/out produces one huge frame delta that used to
+    # disguise it as a moving scene. Ignore the single largest delta when there are
+    # enough samples so one transition can't inflate the score.
+    if len(scores) >= 3:
+        scores.remove(max(scores))
+    elif len(scores) == 2:
+        return min(scores)
     return mean(scores)
 
 
@@ -771,10 +794,13 @@ def analyze_sampled_frames(
     has_flat_background = average_dominant_coverage >= settings.min_dominant_coverage
     has_text_like_edges = settings.min_edge_density <= average_edge_density <= settings.max_edge_density
     has_compact_edge_rows = average_edge_row_coverage <= settings.max_edge_row_coverage
-    drop = is_static and has_flat_background and has_text_like_edges and has_compact_edge_rows
+    # A static flat frame with almost no edges is a blank card (solid color or a
+    # near-empty transition frame); those are as useless in the shuffle as text cards.
+    is_blank_card = is_static and has_flat_background and average_edge_density < settings.min_edge_density
+    drop = is_static and has_flat_background and has_compact_edge_rows and (has_text_like_edges or is_blank_card)
 
     if drop:
-        reason = "text_only_heuristic_matched"
+        reason = "blank_static_scene_matched" if is_blank_card else "text_only_heuristic_matched"
     else:
         failures: list[str] = []
         if not is_static:
@@ -1410,8 +1436,8 @@ def main() -> int:
     manifests_dir = job_dir / "manifests"
     formatted_path = formatted_dir / f"{source_name}_vegas_source.mp4"
     final_output_path = output_dir / f"{source_name}_shuffled.mp4"
-    summary_path = output_dir / f"{source_name}_shuffle_summary.json"
-    filter_manifest_path = output_dir / f"{source_name}_segment_filter_report.json"
+    summary_path = manifests_dir / f"{source_name}_shuffle_summary.json"
+    filter_manifest_path = manifests_dir / f"{source_name}_segment_filter_report.json"
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1422,10 +1448,6 @@ def main() -> int:
             raise FileExistsError(
                 f"Final output already exists: {final_output_path}. Use --overwrite or choose a different --output-dir."
             )
-    if summary_path.exists() and args.overwrite:
-        summary_path.unlink()
-    if filter_manifest_path.exists() and args.overwrite:
-        filter_manifest_path.unlink()
 
     prepare_job_directories(job_dir, args.overwrite)
 
@@ -1634,14 +1656,14 @@ def main() -> int:
         end_card_filter_suppression=end_card_filter_suppression,
     )
 
-    if not args.keep_intermediate:
-        print("Cleaning up intermediate files...")
-        shutil.rmtree(job_dir)
-
     print(f"Done.")
     print(f"  Final shuffled output: {final_output_path}")
-    print(f"  Shuffle summary:       {summary_path}")
-    print(f"  Segment filter report: {filter_manifest_path}")
+    if args.keep_intermediate:
+        print(f"  Shuffle summary:       {summary_path}")
+        print(f"  Segment filter report: {filter_manifest_path}")
+    else:
+        print("Cleaning up intermediate files (clips, manifests, reports)...")
+        shutil.rmtree(job_dir)
     return 0
 
 

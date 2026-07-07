@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""Transcribe an audio file with faster-whisper and cut filler words ("um", "uh") out of it.
+
+Stage 2 of the audio chain (see pipeline.py). Produces two artifacts: a JSON transcript
+with word-level timestamps and a cleaned audio file with matched filler intervals removed
+via ffmpeg atrim+concat.
+
+Whisper models are trained on transcripts that omit disfluencies, so out of the box they
+skip most "um"s entirely. This script counters that by priming the decoder every window
+with filler-heavy hotwords and an initial prompt, disabling token suppression, and using
+a low word-probability gate for filler matches (fillers score low confidence even when
+correctly transcribed). Elongated variants such as "ummm"/"uhhh" are matched by collapsing
+repeated letters before comparison.
+"""
 
 import argparse
 import json
@@ -12,9 +25,14 @@ from pathlib import Path
 
 DEFAULT_MODEL = "large-v3"
 DEFAULT_FILLERS = ["uh", "um"]
-DEFAULT_WORD_PROBABILITY = 0.60
-DEFAULT_MAX_FILLER_DURATION = 0.80
+DEFAULT_WORD_PROBABILITY = 0.0
+DEFAULT_MAX_FILLER_DURATION = 1.00
 DEFAULT_PADDING_SECONDS = 0.02
+DEFAULT_HOTWORDS = "Um, uh, umm, uhh, hmm"
+DEFAULT_INITIAL_PROMPT = (
+    "So, um, I was thinking... uh, well, hmm, you know, it's like, um, yeah. "
+    "Transcribe every word verbatim, including filler words like um and uh."
+)
 DEFAULT_AUDIO_BITRATE_BY_CODEC = {
     "aac": "192k",
     "libmp3lame": "192k",
@@ -111,6 +129,31 @@ def parse_args():
         help="Speech padding used by VAD, in milliseconds. Default: 200.",
     )
     parser.add_argument(
+        "--hotwords",
+        default=DEFAULT_HOTWORDS,
+        help=(
+            "Hotwords fed to the decoder on every window to bias it toward transcribing "
+            "disfluencies verbatim. Pass an empty string to disable. Default keeps filler words."
+        ),
+    )
+    parser.add_argument(
+        "--initial-prompt",
+        default=DEFAULT_INITIAL_PROMPT,
+        help=(
+            "Initial prompt for the first decoding window, styled with fillers so the model "
+            "mimics verbatim transcription. Pass an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--suppress-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply Whisper's default token-suppression list. Disabled by default because it can "
+            "hide short disfluency tokens."
+        ),
+    )
+    parser.add_argument(
         "--condition-on-previous-text",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -132,13 +175,17 @@ def parse_args():
         "--min-word-probability",
         type=bounded_probability,
         default=DEFAULT_WORD_PROBABILITY,
-        help="Minimum word probability required before a filler match is eligible for cutting. Default: 0.60.",
+        help=(
+            "Minimum word probability required before a filler match is eligible for cutting. "
+            "Whisper assigns very low confidence to fillers even when they are real (median ~0.08 "
+            "in testing), so the default accepts all transcribed filler tokens. Default: 0.0."
+        ),
     )
     parser.add_argument(
         "--max-filler-duration",
         type=positive_float,
         default=DEFAULT_MAX_FILLER_DURATION,
-        help="Only cut matches this long or shorter, in seconds. Default: 0.80.",
+        help="Only cut matches this long or shorter, in seconds. Default: 1.00.",
     )
     parser.add_argument(
         "--padding-seconds",
@@ -225,6 +272,17 @@ def normalize_token(text):
     return cleaned.strip("'")
 
 
+def collapse_repeats(token):
+    """Collapse runs of the same letter so elongated fillers match: 'ummm' -> 'um'."""
+    return re.sub(r"(.)\1+", r"\1", token)
+
+
+def is_filler_token(normalized_word, filler_tokens, collapsed_filler_tokens):
+    if normalized_word in filler_tokens:
+        return True
+    return collapse_repeats(normalized_word) in collapsed_filler_tokens
+
+
 def require_binary(binary_name):
     resolved = shutil.which(binary_name)
     if not resolved:
@@ -273,13 +331,14 @@ def serialize_segments(segments):
 
 
 def collect_filler_matches(segments, filler_tokens, min_probability, max_duration):
+    collapsed_filler_tokens = {collapse_repeats(token) for token in filler_tokens}
     matches = []
     for segment in segments:
         for word in segment.words or []:
             if word.start is None or word.end is None:
                 continue
             normalized_word = normalize_token(word.word)
-            if normalized_word not in filler_tokens:
+            if not is_filler_token(normalized_word, filler_tokens, collapsed_filler_tokens):
                 continue
             duration = float(word.end) - float(word.start)
             probability = getattr(word, "probability", 0.0) or 0.0
@@ -451,6 +510,9 @@ def main():
             "speech_pad_ms": args.vad_speech_pad_ms,
         },
         condition_on_previous_text=args.condition_on_previous_text,
+        hotwords=args.hotwords or None,
+        initial_prompt=args.initial_prompt or None,
+        suppress_tokens=[-1] if args.suppress_tokens else [],
     )
     segments = list(segments_iterable)
     total_duration = float(getattr(info, "duration", 0.0) or 0.0)
@@ -484,6 +546,9 @@ def main():
             "vad_min_silence_ms": args.vad_min_silence_ms,
             "vad_speech_pad_ms": args.vad_speech_pad_ms,
             "condition_on_previous_text": args.condition_on_previous_text,
+            "hotwords": args.hotwords,
+            "initial_prompt": args.initial_prompt,
+            "suppress_tokens": args.suppress_tokens,
         },
         "info": serialize_info(info),
         "fillers": {
@@ -506,8 +571,23 @@ def main():
     if not args.cut_fillers or not cut_intervals:
         if cleaned_output.exists() and not args.overwrite:
             raise SystemExit(f"Cleaned output already exists. Use --overwrite to replace it: {cleaned_output}")
-        shutil.copy2(input_path, cleaned_output)
-        print(f"No fillers to cut; copied input → {cleaned_output}")
+        if cleaned_output.suffix.lower() == input_path.suffix.lower() or total_duration <= 0:
+            shutil.copy2(input_path, cleaned_output)
+            print(f"No fillers to cut; copied input → {cleaned_output}")
+        else:
+            # A byte copy would put the wrong container behind the new extension.
+            audio_codec = choose_audio_codec(cleaned_output, args.audio_codec)
+            audio_bitrate = choose_audio_bitrate(audio_codec, args.audio_bitrate)
+            write_cleaned_audio(
+                ffmpeg_bin or require_binary(args.ffmpeg_bin),
+                input_path,
+                cleaned_output,
+                [(0.0, total_duration)],
+                audio_codec,
+                audio_bitrate,
+                args.overwrite,
+            )
+            print(f"No fillers to cut; re-encoded input → {cleaned_output}")
     else:
         cut_total = sum(e - s for s, e in cut_intervals)
         print(f"Cutting {len(cut_intervals)} filler interval(s) ({cut_total:.2f}s removed)")

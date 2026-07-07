@@ -4,3 +4,12 @@ __pycache__/
 downloads/
 vegas_output/
 deno
+
+# Media artifacts from pipeline runs
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.mkv
+*.webm
+*_transcript.json

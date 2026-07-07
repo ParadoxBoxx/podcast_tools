@@ -1,3 +1,14 @@
+"""Batch-download YouTube videos and transcode them into silent Vegas-ready H.264 MP4s.
+
+Part of the video chain (see pipeline.py). Reads URLs from a links file (default
+links.txt), downloads best-quality video with yt-dlp (using Firefox cookies and the local
+deno binary for signature solving), then strips audio and re-encodes to yuv420p H.264 —
+NVENC when available, libx264 otherwise. Both the download and encode phases run several
+workers in parallel.
+
+Warning: the download and output directories are wiped at the start of every run.
+"""
+
 import argparse
 import subprocess
 import concurrent.futures

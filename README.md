@@ -1,43 +1,116 @@
 # podcast_tools
 
-Three script-first media utilities live here:
+Tools for producing a two-person podcast: an **audio chain** that turns two raw speaker
+recordings into a cleaned, filler-free episode file, and a **video chain** that turns
+YouTube videos into silent, scene-shuffled Vegas-ready background visuals.
 
-- `pan_mix_truncate.py` pans two source tracks apart, mixes them into one stereo file, and optionally truncates silence after the combined mix.
-- `transcribe_and_cut_fillers.py` creates a timestamped JSON transcript with faster-whisper word timings and can cut matched filler words such as `uh` from the audio.
-- `yt_shuffle_scenes.py` downloads or reuses a source video, formats it to the same silent Vegas-ready H.264 MP4 profile as `yt_to_vegas.py`, cuts scene clips, shuffles them, and renders a final master.
+`pipeline.py` runs each chain end to end. Every stage script also works standalone.
 
-## Prerequisites
+```
+AUDIO CHAIN   host.wav + guest.wav
+                │  pan_mix_truncate.py        pan apart, mix, truncate silence
+                ▼
+              <name>_mixed.wav                (kept — the "raw" mix)
+                │  transcribe_and_cut_fillers.py   whisper transcript, cut "um"/"uh"
+                ▼
+              <name>_final.mp3                (kept — the episode)
+                │  fit_media_under_cap.py     optional, only with --max-size
+                ▼
+              <name>_final.mp3 under the cap
 
-- `ffmpeg` and `ffprobe` must be on `PATH`.
-- Use the local virtual environment in this folder: `source .venv/bin/activate`
-- Install Python dependencies with `pip install -r requirements.txt`
+VIDEO CHAIN   YouTube URL / local file / links.txt
+                │  yt_shuffle_scenes.py       download, encode silent H.264,
+                │                             detect scenes, drop junk scenes,
+                ▼                             shuffle, concat
+              <source>_shuffled.mp4           (kept)
 
-## Examples
-
-Mix two mono-style tracks, pan them apart, and truncate silence on the combined output:
-
-```bash
-./.venv/bin/python pan_mix_truncate.py host.wav guest.wav merged.wav --overwrite
+              (--no-shuffle instead runs yt_to_vegas.py: plain batch
+               download + silent Vegas-ready encode, no scene work)
 ```
 
-Transcribe a merged file and cut detected `uh` fillers while saving both the transcript JSON and cleaned audio:
+## Setup
+
+- `ffmpeg` and `ffprobe` on `PATH` (NVENC is used automatically when available).
+- `source .venv/bin/activate` then `pip install -r requirements.txt`.
+- The `deno` binary in this folder is used by yt-dlp for YouTube signature solving.
+
+## Usage
+
+Full audio chain — mixes, cuts fillers, writes `ep12_mixed.wav` + `ep12_final.mp3`:
 
 ```bash
-./.venv/bin/python transcribe_and_cut_fillers.py merged.wav --transcript-output transcript.json --cleaned-output cleaned.wav --language en --overwrite
+./pipeline.py audio host.wav guest.wav --name ep12 --out-dir episodes/
 ```
 
-Shuffle scene clips from a YouTube video into a new silent Vegas-ready master while keeping intermediates for inspection:
+Add a size cap and keep the transcript JSON:
 
 ```bash
-./.venv/bin/python yt_shuffle_scenes.py 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' --shuffle-seed 7 --keep-intermediate --overwrite
+./pipeline.py audio host.wav guest.wav --name ep12 --max-size 500M --keep-intermediate
 ```
+
+Full video chain — one shuffled MP4 per URL in the links file, written to `vegas_output/`:
+
+```bash
+./pipeline.py video links.txt
+./pipeline.py video 'https://www.youtube.com/watch?v=...' --shuffle-seed 7
+./pipeline.py video links.txt --no-shuffle     # plain Vegas encodes, no shuffling
+```
+
+By default only the end products (plus the mixed raw audio) are kept; per-scene clips,
+manifests, filter reports, and transcripts are deleted. Pass `--keep-intermediate` to
+either subcommand to keep them for inspection.
+
+## Stage scripts
+
+| Script | Role | Standalone example |
+| --- | --- | --- |
+| `pan_mix_truncate.py` | Pan two mono-like tracks apart, mix to stereo, truncate silence Audacity-style (removed from the middle of each silent region). | `./pan_mix_truncate.py host.wav guest.wav merged.wav --overwrite` |
+| `transcribe_and_cut_fillers.py` | faster-whisper transcript with word timings; cuts matched `um`/`uh` (and elongated `umm`/`uhh`) intervals. | `./transcribe_and_cut_fillers.py merged.wav --transcript-output t.json --cleaned-output clean.mp3 --language en` |
+| `fit_media_under_cap.py` | Two-pass re-encode to the best quality that fits a size cap; leaves files already under the cap alone. | `./fit_media_under_cap.py episode.mp4 --max-size 10GiB` |
+| `yt_shuffle_scenes.py` | Download/reuse a video, encode silent Vegas H.264, detect scenes, drop junk scenes, shuffle, concat. | `./yt_shuffle_scenes.py 'https://youtube.com/watch?v=...' --shuffle-seed 7 --overwrite` |
+| `yt_to_vegas.py` | Parallel batch download + silent Vegas-ready encode of every URL in a links file. **Wipes its download/output dirs on every run.** | `./yt_to_vegas.py --input-file links.txt` |
+
+## Filler-word cutting: how accuracy was fixed
+
+Whisper models are trained on transcripts that omit disfluencies, so by default they
+simply don't write most "um"s — no matching can recover them afterwards. The script now:
+
+- feeds filler-heavy **hotwords** and an **initial prompt** to the decoder so it
+  transcribes disfluencies verbatim,
+- disables Whisper's default token suppression list,
+- accepts filler matches at **any confidence** (Whisper assigns fillers a median
+  probability of ~0.08 even when they are real — the old 0.60 gate rejected nearly all
+  true matches),
+- matches elongated variants (`ummm`, `uhh`) by collapsing repeated letters.
+
+Add more tokens with `--filler` (repeatable/comma-separated). If it ever cuts real words,
+raise `--min-word-probability` or lower `--max-filler-duration`.
+
+## Scene filters: what gets dropped and why
+
+Three filters run before clips are cut, in this order:
+
+1. **Text-only filter** — static scenes with a flat background and either a compact band
+   of text-like edges (title cards, quote screens) or almost no edges at all (blank
+   cards). Motion scoring ignores the single largest frame-to-frame delta, so cards with
+   fade-in/out animations still register as static (this was the main source of leaked
+   title cards before).
+2. **Black-scene filter** — scenes where ≥90% of pixels are dark; catches fade-through
+   transitions and dark company logo cards. Disable with `--no-filter-black-scenes`.
+3. **End-card filter** — static, branded-layout scenes in the trailing timeline window
+   (outro/end screens). Tune with the `--end-card-*` flags.
+
+Every filter is suppression-safe: if it would drop *all* remaining scenes it keeps them
+instead and records the suppression in the run report
+(`<work-dir>/<source>/manifests/<source>_segment_filter_report.json`, kept only with
+`--keep-intermediate`).
 
 ## Notes
 
-- `transcribe_and_cut_fillers.py` defaults to the `large-v3` Whisper model for accuracy. The first real run will download model files unless you point `--model` at a local model path or use `--local-files-only`.
-- If startup time or hardware is a concern, choose a smaller model with `--model`, but expect lower transcript quality and less reliable filler cuts.
-- `pan_mix_truncate.py` is tuned for mono-like input tracks. Stereo inputs currently trigger a warning because the balance-shift approach is not a true positional pan.
-- `yt_shuffle_scenes.py` now defaults to a more sensitive scene threshold (`0.20`) and shorter minimum kept scene duration (`0.75s`) so smaller cuts survive detection more often.
-- `yt_shuffle_scenes.py` applies a conservative text-only/title-card filter before clip cutting. It now combines low motion, flat-background coverage, edge density, and edge-row concentration so obvious static cards are caught more reliably without treating moving footage with subtitles as text-only. Disable it with `--no-filter-text-only-scenes` or tune it with the `--text-filter-*` flags if your source includes borderline static graphics.
-- `yt_shuffle_scenes.py` also runs a separate trailing end-card pass by default. It samples the remaining late-timeline scenes even when the text-only filter is disabled, and only removes a final suffix of likely static branded outro/end-screen scenes. If that pass would remove every remaining segment, the script warns, preserves them all, and records the suppression in the summary/report instead of emitting an empty concat. Disable it with `--no-remove-end-cards` or tighten the late-window bounds with `--end-card-window-seconds`, `--end-card-min-start-ratio`, `--end-card-min-duration`, and `--end-card-max-duration`.
-- `yt_shuffle_scenes.py` also accepts a local video file path instead of a YouTube URL so the formatting, scene-cutting, and shuffle pipeline can be tested offline.
+- `transcribe_and_cut_fillers.py` defaults to the `large-v3` model; the first run
+  downloads weights unless you use `--local-files-only` or point `--model` elsewhere.
+  On a CUDA GPU, `--device cuda --compute-type float16` is much faster.
+- `yt_shuffle_scenes.py` accepts a local video file instead of a URL, which is handy for
+  offline testing of the scene/filter/shuffle pipeline.
+- `pan_mix_truncate.py` expects mono-like inputs; stereo sources are balance-shifted
+  rather than true-panned and produce a warning.

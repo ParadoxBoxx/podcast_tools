@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""Shrink a media file to the highest practical quality that fits under a size cap.
+
+Optional final stage of the audio chain (see pipeline.py), also usable on video. Probes
+the input with ffprobe, computes a bitrate budget for the requested cap (with a safety
+margin and mux overhead), and re-encodes with two-pass ffmpeg. If the first attempt
+overshoots, it retries once at a reduced bitrate. Files already under the cap are left
+untouched (or copied unchanged when an explicit --output is given).
+
+The original container is preserved when it is a safe bitrate-targeted output; otherwise
+the script falls back to .mkv (video) or .m4a (audio).
+"""
 
 import argparse
 import json

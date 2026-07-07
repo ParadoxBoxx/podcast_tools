@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Pan two source tracks apart, mix them into one stereo file, and truncate silence.
+
+Stage 1 of the audio chain (see pipeline.py). Takes the two speaker recordings (host and
+guest), balance-shifts them left/right for separation, mixes them, and then shortens long
+silent regions the way Audacity's Truncate Silence does: silence is removed from the
+middle of each region so word tails and onsets stay intact.
+
+Inputs should be mono-like; stereo sources are balance-shifted rather than true-panned
+and trigger a warning. Requires ffmpeg on PATH.
+"""
 
 import argparse
 import re
